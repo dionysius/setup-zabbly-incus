@@ -1,0 +1,121 @@
+name: Integration
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  vm-and-container:
+    name: ${{ matrix.os }}
+    runs-on: ubuntu-${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ['22.04', '24.04']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Zabbly Incus
+        id: setup
+        uses: ./
+        with:
+          vm: 'true'
+
+      - name: Report environment
+        run: |
+          {
+            echo "### ${{ matrix.os }} — environment"
+            echo '```'
+            echo "runner:  $(. /etc/os-release; echo "$PRETTY_NAME") $(uname -m)"
+            echo "incus:   ${{ steps.setup.outputs.incus-version }}"
+            echo "kvm:     ${{ steps.setup.outputs.kvm-present }}"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Proof 1: a system container comes up and reaches cloud-init done (basic install sanity).
+      - name: Container works
+        run: |
+          set -euo pipefail
+          incus launch images:debian/13/cloud c1
+          incus exec c1 -- cloud-init status --wait
+          incus exec c1 -- cat /etc/os-release
+          incus delete -f c1
+
+      # Proof 2 (the point of this action): a KVM VM boots, gets outbound network through the Docker
+      # firewall, and faithfully applies a systemd sandbox directive that a *container* would mask.
+      - name: VM works end-to-end + sandbox-fidelity probe
+        run: |
+          set -euo pipefail
+          t0=$SECONDS
+          # No /dev/kvm -> this fails here, which is itself the conclusive answer.
+          incus launch images:debian/13/default v --vm -c limits.cpu=2 -c limits.memory=2GiB
+          echo "launched in $((SECONDS - t0))s; waiting for agent..."
+          for _ in $(seq 1 60); do incus exec v -- true 2>/dev/null && break; sleep 3; done
+          incus exec v -- true  # hard fail if the agent never came up
+          echo "VM agent up after $((SECONDS - t0))s total"
+
+          # Outbound network proves the DOCKER-USER firewall fix worked (bridge FORWARD not dropped).
+          incus exec v -- sh -c 'getent hosts deb.debian.org >/dev/null && echo NET=OK'
+
+          # ProcSubset=pid must hide /proc/cpuinfo in a real VM. A system container silently neutralises
+          # this directive (forces ProcSubset=all) — so CPUINFO=BLOCKED is the fidelity we need.
+          incus exec v -- bash -c '
+            set -e
+            echo "guest: $(. /etc/os-release; echo "$PRETTY_NAME")"
+            systemctl --version | head -1
+            printf "%s\n" \
+              "[Service]" \
+              "Type=oneshot" \
+              "ProtectSystem=strict" \
+              "ProtectProc=noaccess" \
+              "ProcSubset=pid" \
+              "ExecStart=/bin/sh -c \"cat /proc/cpuinfo >/dev/null 2>&1 && echo CPUINFO=READABLE || echo CPUINFO=BLOCKED\"" \
+              > /etc/systemd/system/sandbox-probe.service
+            systemctl daemon-reload
+            systemctl start sandbox-probe.service
+            result=$(journalctl -u sandbox-probe.service -o cat | grep -o "CPUINFO=[A-Z]*" | tail -1)
+            echo "ProcSubset=pid -> $result"
+            test "$result" = "CPUINFO=BLOCKED"
+          ' | tee /tmp/probe.out
+
+          {
+            echo "### ${{ matrix.os }} — VM result"
+            echo '```'
+            echo "boot+agent: $((SECONDS - t0))s"
+            grep -E 'guest:|systemd|CPUINFO=|NET=' /tmp/probe.out || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup
+        if: always()
+        run: incus delete -f v c1 2>/dev/null || true
+
+  # Containers-only path: vm: false must NOT fail even where KVM would be required otherwise.
+  container-only:
+    name: container-only (vm:false)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Zabbly Incus (no VM)
+        uses: ./
+        with:
+          vm: 'false'
+
+      - name: Container works
+        run: |
+          set -euo pipefail
+          incus launch images:debian/13/cloud c1
+          incus exec c1 -- cloud-init status --wait
+          incus delete -f c1

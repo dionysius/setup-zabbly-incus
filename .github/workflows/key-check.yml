@@ -1,0 +1,41 @@
+name: Zabbly key drift
+
+# The Zabbly signing key is embedded as zabbly.asc for reproducibility. Re-download it and diff,
+# so key rotation surfaces as a failing check rather than a silent install-time trust decision.
+on:
+  schedule:
+    - cron: '37 6 * * 1'  # weekly, Monday
+  push:
+    branches: [main, master]
+    paths: ['zabbly.asc', '.github/workflows/key-check.yml']
+  pull_request:
+    paths: ['zabbly.asc', '.github/workflows/key-check.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diff:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Compare committed key against upstream
+        run: |
+          set -euo pipefail
+          curl -fsSL https://pkgs.zabbly.com/key.asc -o live.asc
+          # Compare canonical fingerprints, not raw bytes (armor/signature packets can re-encode).
+          fpr() { gpg --with-colons --show-keys "$1" | awk -F: '/^fpr:/ {print $10; exit}'; }
+          committed="$(fpr zabbly.asc)"
+          live="$(fpr live.asc)"
+          echo "committed: $committed"
+          echo "live:      $live"
+          if [ "$committed" != "$live" ]; then
+            echo "::error::Embedded zabbly.asc fingerprint differs from upstream. Re-download https://pkgs.zabbly.com/key.asc and review the rotation."
+            exit 1
+          fi
+          echo "Key fingerprint matches upstream."

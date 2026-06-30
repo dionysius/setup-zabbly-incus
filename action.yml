@@ -1,0 +1,145 @@
+name: 'Setup Zabbly Incus'
+description: 'Install & configure Incus (Zabbly packages) on a runner, ready for containers and KVM VMs'
+branding:
+  icon: 'box'
+  color: 'blue'
+
+inputs:
+  channel:
+    default: 'stable'
+    description: 'Zabbly repo line: stable | lts'
+    required: false
+  group:
+    default: 'adm'
+    description: 'Socket group for non-sudo incus access (must be a group the runner user is already in)'
+    required: false
+  preseed:
+    default: ''
+    description: 'incus admin init preseed YAML (empty = --minimal)'
+    required: false
+  bridges:
+    default: 'incusbr0'
+    description: 'Comma-separated bridges to allow through the Docker firewall'
+    required: false
+  vm:
+    default: 'true'
+    description: 'Set up KVM and require /dev/kvm; fail fast if absent'
+    required: false
+  firewall:
+    default: 'docker-user'
+    description: 'Docker coexistence strategy: docker-user | flush | none'
+    required: false
+
+outputs:
+  kvm-present:
+    description: 'Whether /dev/kvm was found (true/false)'
+    value: '${{ steps.kvm.outputs.present }}'
+  incus-version:
+    description: 'Installed incus version'
+    value: '${{ steps.install.outputs.version }}'
+
+runs:
+  using: composite
+  steps:
+    # Fail fast on the hard requirement before doing slow work: incus has NO software-emulation
+    # fallback, so a VM job without /dev/kvm can never work. Gate here, in seconds, not after install.
+    - name: KVM setup & gate
+      id: kvm
+      shell: bash
+      env:
+        INPUT_VM: '${{ inputs.vm }}'
+      run: |
+        set -euo pipefail
+        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+          | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger --name-match=kvm || true
+        if [ -e /dev/kvm ]; then
+          echo "present=true" >>"$GITHUB_OUTPUT"
+        else
+          echo "present=false" >>"$GITHUB_OUTPUT"
+          if [ "$INPUT_VM" = "true" ]; then
+            echo "::error::/dev/kvm is absent on this runner; incus has no emulation fallback so --vm will fail. Use an amd64 GitHub-hosted runner, or set vm: false for containers only."
+            exit 1
+          fi
+          echo "::warning::/dev/kvm absent; continuing for containers only (vm: false)."
+        fi
+
+    - name: Install incus from Zabbly
+      id: install
+      shell: bash
+      env:
+        INPUT_CHANNEL: '${{ inputs.channel }}'
+      run: |
+        set -euo pipefail
+        case "$INPUT_CHANNEL" in
+          stable) uri='https://pkgs.zabbly.com/incus/stable' ;;
+          lts)    uri='https://pkgs.zabbly.com/incus/lts-6.0' ;;
+          *) echo "::error::unknown channel: $INPUT_CHANNEL (expected stable | lts)"; exit 1 ;;
+        esac
+        sudo install -d -m0755 /etc/apt/keyrings
+        # Embedded, pinned key (see .github/workflows/key-check.yml for drift detection).
+        sudo cp "$GITHUB_ACTION_PATH/zabbly.asc" /etc/apt/keyrings/zabbly.asc
+        {
+          echo "Enabled: yes"
+          echo "Types: deb"
+          echo "URIs: $uri"
+          sed -n 's/VERSION_CODENAME=/Suites: /p' /etc/os-release
+          echo "Components: main"
+          echo "Architectures: $(dpkg --print-architecture)"
+          echo "Signed-By: /etc/apt/keyrings/zabbly.asc"
+        } | sudo tee /etc/apt/sources.list.d/zabbly-incus.sources >/dev/null
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq incus
+        echo "version=$(incus --version)" >>"$GITHUB_OUTPUT"
+
+    # GitHub runners ship Docker, which sets FORWARD policy DROP + a DOCKER-USER chain. That drops
+    # incusbr0 traffic so instances get no network and the VM agent never comes up. The surgical fix
+    # (from canonical/setup-lxd) inserts ACCEPT for the bridge in iptables-nft's DOCKER-USER chain,
+    # keeping Docker working. `flush` is the blunt maxwell-k fallback for jobs that don't need Docker.
+    - name: Make incus bridge coexist with Docker
+      shell: bash
+      env:
+        INPUT_BRIDGES: '${{ inputs.bridges }}'
+        INPUT_FIREWALL: '${{ inputs.firewall }}'
+      run: |
+        set -euo pipefail
+        case "$INPUT_FIREWALL" in
+          none) : ;;
+          flush) sudo nft flush ruleset ;;
+          docker-user)
+            IFS=',' read -ra BR <<<"$INPUT_BRIDGES"
+            for raw in "${BR[@]}"; do
+              b="$(echo "$raw" | xargs)"  # trim whitespace
+              [ -n "$b" ] || continue
+              for ipt in iptables ip6tables; do
+                if sudo "$ipt" -nL DOCKER-USER >/dev/null 2>&1; then
+                  sudo "$ipt" -I DOCKER-USER -i "$b" -j ACCEPT
+                  sudo "$ipt" -I DOCKER-USER -o "$b" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+                fi
+              done
+            done ;;
+          *) echo "::error::unknown firewall mode: $INPUT_FIREWALL (expected docker-user | flush | none)"; exit 1 ;;
+        esac
+
+    # Repoint the deb-incus socket group from incus-admin to one the runner user is already in (adm),
+    # so plain `incus` works without sudo (mirrors maxwell-k; canonical does the snap equivalent).
+    - name: Grant non-sudo access & init
+      shell: bash
+      env:
+        INPUT_GROUP: '${{ inputs.group }}'
+        INPUT_PRESEED: '${{ inputs.preseed }}'
+      run: |
+        set -euo pipefail
+        sudo sed -i "s/incus-admin/${INPUT_GROUP}/" \
+          /usr/lib/systemd/system/incus.service \
+          /usr/lib/systemd/system/incus.socket
+        sudo systemctl daemon-reload
+        sudo systemctl restart incus.socket
+        sudo incus admin waitready
+        if [ -z "$INPUT_PRESEED" ]; then
+          sudo incus admin init --minimal
+        else
+          sudo incus admin init --preseed <<<"$INPUT_PRESEED"
+        fi
+        sudo incus config set images.compression_algorithm none || true
