@@ -1,0 +1,140 @@
+name: Integration
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  vm-and-container:
+    name: ${{ matrix.os }} / ${{ matrix.arch }} / ${{ matrix.channel }}
+    # arm64 hosted runners use the -arm label suffix.
+    runs-on: ${{ matrix.arch == 'arm64' && format('ubuntu-{0}-arm', matrix.os) || format('ubuntu-{0}', matrix.os) }}
+    # arm64 hosted runners have no /dev/kvm, so the vm:true KVM gate fails by design. Allow it: a
+    # canary that flips green the day arm64 runners gain KVM. amd64 must stay strictly green.
+    continue-on-error: ${{ matrix.arch == 'arm64' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ['22.04', '24.04']
+        channel: ['stable', 'lts-7.0', 'lts-6.0']
+        arch: ['amd64', 'arm64']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Setup Zabbly Incus
+        id: setup
+        uses: ./
+        with:
+          channel: ${{ matrix.channel }}
+          vm: 'true'
+
+      - name: Report environment
+        run: |
+          {
+            echo "### ${{ matrix.os }} / ${{ matrix.arch }} / ${{ matrix.channel }} — environment"
+            echo '```'
+            echo "runner:  $(. /etc/os-release; echo "$PRETTY_NAME") $(uname -m)"
+            echo "incus:   ${{ steps.setup.outputs.incus-version }}"
+            echo "kvm:     ${{ steps.setup.outputs.kvm-present }}"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Proof 1: a system container comes up and reaches cloud-init done (basic install sanity).
+      - name: Container works
+        run: |
+          set -euo pipefail
+          incus launch images:debian/13/cloud c1
+          incus exec c1 -- cloud-init status --wait
+          incus exec c1 -- cat /etc/os-release
+          # Outbound network from the container (same incusbr0 FORWARD path as the VM).
+          incus exec c1 -- apt-get update
+          incus delete -f c1
+
+      # Proof 2 (the point of this action): a KVM VM boots, gets outbound network through the Docker
+      # firewall, and faithfully applies a systemd sandbox directive that a *container* would mask.
+      - name: VM works end-to-end + sandbox-fidelity probe
+        run: |
+          set -euo pipefail
+          t0=$SECONDS
+          # No /dev/kvm -> this fails here, which is itself the conclusive answer.
+          incus launch images:debian/13/default v --vm -c limits.cpu=2 -c limits.memory=2GiB
+          echo "launched in $((SECONDS - t0))s; waiting for agent..."
+          for _ in $(seq 1 60); do incus exec v -- true 2>/dev/null && break; sleep 3; done
+          incus exec v -- true  # hard fail if the agent never came up
+          echo "VM agent up after $((SECONDS - t0))s total"
+
+          # Connectivity: real outbound traffic through the bridge FORWARD path that DOCKER-USER
+          # governs. apt-get update does DNS + a TCP fetch from an external mirror — exactly what a
+          # consumer (installing .debs in the VM) needs. A bare DNS lookup would only reach the local
+          # incusbr0 resolver (host INPUT, not FORWARD) and would NOT prove the firewall fix.
+          : > /tmp/probe.out
+          if incus exec v -- apt-get update; then
+            echo NET=OK | tee -a /tmp/probe.out
+          else
+            echo "::error::VM has no outbound network (apt-get update failed) — the Docker firewall fix is not working"
+            exit 1
+          fi
+
+          # A real VM applies systemd sandbox directives faithfully; an incus *system container* masks
+          # several of them. We assert four, each touching a different subsystem (every grep -q is an
+          # assertion — set -e fails the job if a directive did not take effect):
+          #   ProcSubset=pid          -> /proc/cpuinfo hidden          (CPUINFO=BLOCKED; the canonical
+          #                                                             one a container forces back to all)
+          #   ProtectKernelTunables   -> /proc/sys read-only           (PROCSYS=READONLY)
+          #   ProtectSystem=strict    -> /usr read-only                (USR=READONLY)
+          #   ProtectControlGroups    -> /sys/fs/cgroup read-only      (CGROUP=READONLY)
+          incus exec v -- bash -c '
+            set -e
+            echo "guest: $(. /etc/os-release; echo "$PRETTY_NAME")"
+            systemctl --version | head -1
+            # Build the probe script (printf, not a heredoc, to stay inside the YAML block scalar). It
+            # runs as root, so only the sandbox can block these writes. No set -e here: each check must
+            # run regardless of the previous result.
+            printf "%s\n" \
+              "#!/bin/sh" \
+              "cat /proc/cpuinfo >/dev/null 2>&1 && echo CPUINFO=READABLE || echo CPUINFO=BLOCKED" \
+              "if ( echo 0 >/proc/sys/kernel/dmesg_restrict ) 2>/dev/null; then echo PROCSYS=WRITABLE; else echo PROCSYS=READONLY; fi" \
+              "if ( touch /usr/.sandbox-probe ) 2>/dev/null; then echo USR=WRITABLE; rm -f /usr/.sandbox-probe; else echo USR=READONLY; fi" \
+              "if ( mkdir /sys/fs/cgroup/.sandbox-probe ) 2>/dev/null; then echo CGROUP=WRITABLE; rmdir /sys/fs/cgroup/.sandbox-probe; else echo CGROUP=READONLY; fi" \
+              "exit 0" \
+              > /usr/local/bin/sandbox-probe.sh
+            chmod +x /usr/local/bin/sandbox-probe.sh
+            printf "%s\n" \
+              "[Service]" \
+              "Type=oneshot" \
+              "ProtectSystem=strict" \
+              "ProtectProc=noaccess" \
+              "ProcSubset=pid" \
+              "ProtectKernelTunables=true" \
+              "ProtectControlGroups=true" \
+              "ExecStart=/usr/local/bin/sandbox-probe.sh" \
+              > /etc/systemd/system/sandbox-probe.service
+            systemctl daemon-reload
+            systemctl start sandbox-probe.service
+            out=$(journalctl -u sandbox-probe.service -o cat)
+            echo "$out"
+            echo "$out" | grep -q CPUINFO=BLOCKED
+            echo "$out" | grep -q PROCSYS=READONLY
+            echo "$out" | grep -q USR=READONLY
+            echo "$out" | grep -q CGROUP=READONLY
+          ' | tee -a /tmp/probe.out
+
+          {
+            echo "### ${{ matrix.os }} / ${{ matrix.arch }} / ${{ matrix.channel }} — VM result"
+            echo '```'
+            echo "boot+agent: $((SECONDS - t0))s"
+            grep -E 'guest:|systemd|CPUINFO=|PROCSYS=|USR=|CGROUP=|NET=' /tmp/probe.out || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup
+        if: always()
+        run: incus delete -f v c1 2>/dev/null || true
